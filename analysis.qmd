@@ -1,0 +1,26 @@
+---
+title: "analysis"
+format: html
+---
+
+```{r}
+library(tidyverse)
+library(tidytransit)
+library(tidycensus)
+
+gtfs = read_gtfs(here::here("gotriangle_gtfs.zip"))
+
+acs_vars = load_variables(year = 2024, dataset = "acs5")
+
+census = get_acs(
+  geography = "tract",
+  variables = c(
+    "med_hh_income_past_12" = "B19013_001"
+  ),
+  year = 2024,
+  state = "NC",
+  survery = "acs5",
+  output = "wide"
+)
+```
+
