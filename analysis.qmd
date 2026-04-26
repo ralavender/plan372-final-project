@@ -7,20 +7,304 @@ format: html
 library(tidyverse)
 library(tidytransit)
 library(tidycensus)
+library(lehdr)
+library(sf)
 
-gtfs = read_gtfs(here::here("gotriangle_gtfs.zip"))
+options(lehdr_use_cache = TRUE)
+options(tigris_use_cache = TRUE)
 
-acs_vars = load_variables(year = 2024, dataset = "acs5")
+triangle_gtfs = read_gtfs(here::here("data", "gotriangle_gtfs.zip"))
 
-census = get_acs(
+triangle_tracts = get_acs(
   geography = "tract",
   variables = c(
-    "med_hh_income_past_12" = "B19013_001"
+    "med_hh_income_past_12" = "B19013_001",
+    "hh_no_vehicle" = "B08201_002",
+    "hh_total" = "B08201_001",
+    "pop_total" = "B01003_001"
   ),
-  year = 2024,
+  year = 2023,
   state = "NC",
-  survery = "acs5",
+  county = c("Wake", "Durham", "Orange"),
+  geometry = TRUE,
+  survey = "acs5",
   output = "wide"
 )
+
+triangle_jobs = grab_lodes(
+  state = "nc",
+  year = 2023,
+  lodes_type = "wac",
+  job_type = "JT00",
+  segment = "S000",
+  agg_geo = "tract",
+  version = "LODES8"
+) %>%
+  filter(str_starts(w_tract, "37135") | str_starts(w_tract, "37063") | str_starts(w_tract, "37183"))
 ```
+```{r}
+# -------------------------
+# 1. Create tract demographic measures
+# -------------------------
+triangle_tracts = triangle_tracts %>%
+  mutate(
+    pct_no_vehicle = hh_no_vehicleE / hh_totalE,
+    area_sqm = as.numeric(st_area(geometry)),
+    area_sqkm = area_sqm / 1000000,
+    pop_density_sqkm = pop_totalE / area_sqkm
+  )
+```
+
+
+```{r}
+triangle_stops = triangle_gtfs$stops %>%
+  st_as_sf(coords = c("stop_lon", "stop_lat"), crs = 4326)
+
+triangle_stops = st_transform(triangle_stops, st_crs(triangle_tracts))
+
+stops_with_tracts = st_join(triangle_stops, triangle_tracts, join = st_within)
+```
+
+```{r}
+# -----------------------------
+# 2. Count stops inside each tract
+# -----------------------------
+
+stops_per_tract = stops_with_tracts %>%
+  st_drop_geometry() %>%
+  filter(!is.na(GEOID)) %>%
+  count(GEOID, name = "n_stops")
+
+triangle_tracts = triangle_tracts %>%
+  left_join(stops_per_tract, by = "GEOID") %>%
+  mutate(n_stops = replace_na(n_stops, 0))
+```
+
+```{r}
+# -----------------------------
+# 3. Stops within 800 meters of tract centroid
+# -----------------------------
+
+triangle_tracts_proj = st_transform(triangle_tracts, 32119)
+triangle_stops_proj = st_transform(triangle_stops, 32119)
+
+tract_centroids_proj = st_centroid(triangle_tracts_proj)
+
+centroid_buffers_800m = tract_centroids_proj %>%
+  select(GEOID) %>%
+  st_buffer(dist = 800)
+
+stops_800m = st_join(
+  triangle_stops_proj,
+  centroid_buffers_800m,
+  join = st_within
+) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(GEOID)) %>%
+  count(GEOID, name = "stops_800m")
+
+triangle_tracts_proj = triangle_tracts_proj %>%
+  left_join(stops_800m, by = "GEOID") %>%
+  mutate(stops_800m = replace_na(stops_800m, 0))
+```
+
+```{r}
+# -----------------------------
+# 4. Distance to nearest stop, in meters
+# -----------------------------
+
+nearest_stop_index = st_nearest_feature(
+  tract_centroids_proj,
+  triangle_stops_proj
+)
+
+nearest_stop_dist = st_distance(
+  tract_centroids_proj,
+  triangle_stops_proj[nearest_stop_index, ],
+  by_element = TRUE
+)
+
+triangle_tracts_proj$nearest_stop_m = as.numeric(nearest_stop_dist)
+```
+
+```{r}
+# -----------------------------
+# 5. Clean and join LODES jobs
+# -----------------------------
+
+jobs_by_tract = triangle_jobs %>%
+  mutate(GEOID = as.character(w_tract)) %>%
+  group_by(GEOID) %>%
+  summarize(
+    total_jobs = sum(C000, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+triangle_tracts_proj = triangle_tracts_proj %>%
+  left_join(jobs_by_tract, by = "GEOID") %>%
+  mutate(total_jobs = replace_na(total_jobs, 0))
+```
+
+```{r}
+# -----------------------------
+# 6. Jobs within 5 km of each tract centroid
+# -----------------------------
+
+job_tract_points = triangle_tracts_proj %>%
+  st_centroid() %>%
+  select(GEOID_job = GEOID, total_jobs)
+
+origin_buffers_5km = tract_centroids_proj %>%
+  select(GEOID_origin = GEOID) %>%
+  st_buffer(dist = 5000)
+
+jobs_within_5km = st_join(
+  job_tract_points,
+  origin_buffers_5km,
+  join = st_within
+) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(GEOID_origin)) %>%
+  group_by(GEOID_origin) %>%
+  summarize(
+    jobs_within_5km = sum(total_jobs, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+triangle_tracts_proj = triangle_tracts_proj %>%
+  left_join(jobs_within_5km, by = c("GEOID" = "GEOID_origin")) %>%
+  mutate(jobs_within_5km = replace_na(jobs_within_5km, 0))
+```
+```{r}
+# -----------------------------
+# 7. Final tract-level analysis dataset
+# -----------------------------
+
+analysis_tracts = triangle_tracts_proj %>%
+  mutate(
+    log_jobs_within_5km = log1p(jobs_within_5km),
+    log_total_jobs = log1p(total_jobs),
+    log_pop_density = log1p(pop_density_sqkm)
+  )
+```
+
+```{r}
+ggplot(analysis_tracts) +
+  geom_sf(aes(fill = nearest_stop_m)) +
+  labs(fill = "Meters to nearest stop")
+
+ggplot(analysis_tracts) +
+  geom_sf(aes(fill = stops_800m)) +
+  labs(fill = "Stops within 800m")
+
+ggplot(analysis_tracts) +
+  geom_sf(aes(fill = jobs_within_5km)) +
+  labs(fill = "Jobs within 5km")
+```
+```{r}
+model_stop_count = lm(
+  n_stops ~ med_hh_income_past_12E + pct_no_vehicle + pop_density_sqkm,
+  data = analysis_tracts
+)
+
+summary(model_stop_count)
+```
+```{r}
+model_nearest_stop = lm(
+  nearest_stop_m ~ med_hh_income_past_12E + pct_no_vehicle + pop_density_sqkm,
+  data = analysis_tracts
+)
+
+summary(model_nearest_stop)
+```
+```{r}
+model_jobs_access = lm(
+  log_jobs_within_5km ~ med_hh_income_past_12E + pct_no_vehicle + pop_density_sqkm,
+  data = analysis_tracts
+)
+
+summary(model_jobs_access)
+```
+```{r}
+rJavaEnv::use_java(21)
+options(java.parameters = "-Xmx4G")
+
+library(r5r)
+
+network = build_network(here::here("data"))
+```
+```{r}
+origins = analysis_tracts %>%
+  st_transform(4326) %>%
+  st_centroid() %>%
+  mutate(
+    lon = st_coordinates(.)[, 1],
+    lat = st_coordinates(.)[, 2]
+  ) %>%
+  st_drop_geometry() %>%
+  transmute(
+    id = GEOID,
+    lon = lon,
+    lat = lat
+  )
+
+destinations = analysis_tracts %>%
+  st_transform(4326) %>%
+  st_centroid() %>%
+  mutate(
+    lon = st_coordinates(.)[, 1],
+    lat = st_coordinates(.)[, 2]
+  ) %>%
+  st_drop_geometry() %>%
+  transmute(
+    id = GEOID,
+    lon = lon,
+    lat = lat,
+    jobs = total_jobs
+  )
+```
+```{r}
+access_45 = accessibility(
+  r5r_network = network,
+  origins = origins,
+  destinations = destinations,
+  opportunities_colnames = "jobs",
+  mode = c("WALK", "TRANSIT"),
+  departure_datetime = as.POSIXct(
+    "2026-03-17 08:00:00",
+    tz = "America/New_York"
+  ),
+  decay_function = "step",
+  cutoffs = 45,
+  max_trip_duration = 45
+)
+
+access_45_clean = access_45 %>%
+  rename(GEOID = id) %>%
+  rename(jobs_access_45_transit = accessibility) %>%
+  select(GEOID, jobs_access_45_transit)
+
+analysis_tracts = analysis_tracts %>%
+  left_join(access_45_clean, by = "GEOID") %>%
+  mutate(
+    jobs_access_45_transit = replace_na(jobs_access_45_transit, 0),
+    log_jobs_access_45_transit = log1p(jobs_access_45_transit)
+  )
+
+ggplot(analysis_tracts) +
+  geom_sf(aes(fill = jobs_access_45_transit)) +
+  labs(fill = "Jobs accessible\nwithin 45 min")
+```
+```{r}
+model_access = lm(
+  log_jobs_access_45_transit ~ 
+    med_hh_income_past_12E +
+    pct_no_vehicle +
+    pop_density_sqkm,
+  data = analysis_tracts
+)
+
+summary(model_access)
+```
+
 
